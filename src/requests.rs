@@ -20,12 +20,13 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct TextGenerationRequest {
     pub id: Option<Uuid>,
     pub prompt: String,
     pub num_prompt_tokens: u64,
     pub num_decode_tokens: Option<u64>,
+    pub image_url: Option<String>,
 }
 
 #[async_trait]
@@ -129,21 +130,41 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         request: Arc<TextGenerationRequest>,
         sender: Sender<TextGenerationAggregatedResponse>,
     ) {
-        let mut url = self.base_url.clone();
+        let mut url: Url = self.base_url.clone();
         url.set_path("/v1/chat/completions");
         // let url = format!("{base_url}", base_url = self.base_url);
         let mut aggregated_response = TextGenerationAggregatedResponse::new(request.clone());
-        let messages = vec![OpenAITextGenerationMessage {
-            role: "user".to_string(),
-            content: request.prompt.clone(),
-        }];
-        let body = OpenAITextGenerationRequest {
-            model: self.model_name.clone(),
-            messages,
-            max_tokens: request.num_decode_tokens,
-            stream: true,
-            stop: None,
-            temperature: 0.0,
+        let body_json = if request.image_url.is_some() {
+            serde_json::json!({
+                "model": self.model_name.clone(),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": request.prompt.clone() },
+                            { "type": "image_url", "image_url": { "url": request.image_url.clone().unwrap() } },
+                        ]
+                    },
+                ],
+                "max_tokens": request.num_decode_tokens,
+                "stream": true,
+                "stop": Option::<String>::None,
+                "temperature": 0.0,
+            })
+        } else {
+            let messages = vec![OpenAITextGenerationMessage {
+                role: "user".to_string(),
+                content: request.prompt.clone(),
+            }];
+            let body = OpenAITextGenerationRequest {
+                model: self.model_name.clone(),
+                messages,
+                max_tokens: request.num_decode_tokens,
+                stream: true,
+                stop: None,
+                temperature: 0.0,
+            };
+            serde_json::json!(body)
         };
         let req = self
             .client
@@ -152,7 +173,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
                 "Authorization",
                 format!("Bearer {token}", token = self.api_key),
             )
-            .json(&serde_json::json!(body))
+            .json(&body_json)
             .timeout(self.timeout);
         // start timer
         aggregated_response.start();
@@ -309,10 +330,11 @@ pub trait TextRequestGenerator: Sync {
     fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str);
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Default)]
 pub struct Conversation {
     pub role: String,
     pub content: String,
+    pub image_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -448,6 +470,7 @@ impl ConversationTextRequestGenerator {
                     .collect::<Vec<&Conversation>>();
                 for (turn_idx, c) in filtered_conversations.iter().enumerate() {
                     let prompt = c.content.clone();
+                    let image_url = c.image_url.clone();
                     let num_decode_tokens = decode_tokenize_opts.clone().map_or_else(
                         || None,
                         |opts| {
@@ -480,6 +503,7 @@ impl ConversationTextRequestGenerator {
                                     return;
                                 }
                             };
+
                             requests.lock().unwrap().insert(
                                 ids[turn_idx],
                                 ConversationTurnRequest {
@@ -491,6 +515,7 @@ impl ConversationTextRequestGenerator {
                                         prompt,
                                         num_prompt_tokens: num_tokens,
                                         num_decode_tokens,
+                                        image_url,
                                     },
                                 },
                             );
@@ -516,6 +541,7 @@ impl ConversationTextRequestGenerator {
                                         prompt: sampled_prompt,
                                         num_prompt_tokens: prompt_tokens,
                                         num_decode_tokens,
+                                        image_url,
                                     },
                                 },
                             );
@@ -554,6 +580,11 @@ impl ConversationTextRequestGenerator {
         let repo = api.dataset(repo_name);
         let dataset = repo.get(&filename)?;
         Ok(dataset)
+    }
+
+    pub fn string_to_pathbuf(filename: String) -> anyhow::Result<PathBuf> {
+        let path = PathBuf::from(filename).clone();
+        Ok(path)
     }
 }
 
@@ -618,6 +649,7 @@ impl TextRequestGenerator for ConversationTextRequestGenerator {
         // and add the next turn id to the new turn
         let new_prompt =
             request.prompt.clone() + "\n" + response + "\n" + next_request.request.prompt.as_str();
+        let image_url = request.image_url.clone();
         // tokenize the prompt
         let (prompt, num_tokens) = match tokenize_prompt(
             new_prompt.to_string(),
@@ -639,6 +671,7 @@ impl TextRequestGenerator for ConversationTextRequestGenerator {
                 prompt,
                 num_prompt_tokens: num_tokens,
                 num_decode_tokens: request.num_decode_tokens, // decode tokens do not change between turns
+                image_url,
             },
         };
         //debug!("Adding new turn to queue: {turn}", turn = turn.request.prompt);
@@ -667,6 +700,7 @@ impl TextRequestGenerator for DummyTextRequestGenerator {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
+            image_url: None,
         }
     }
     fn callback(&mut self, _request: Arc<TextGenerationRequest>, _response: &str) {}
@@ -847,6 +881,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -908,6 +943,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -993,6 +1029,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1039,6 +1076,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1085,6 +1123,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1135,6 +1174,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            image_url: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);

@@ -162,12 +162,19 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
         timestamp: chrono::Utc::now(),
         level: Level::Info,
     }));
-    let filepath = requests::ConversationTextRequestGenerator::download_dataset(
-        run_config.dataset,
-        run_config.dataset_file,
-        run_config.hf_token.clone(),
-    )
-    .expect("Can't download dataset");
+    let filepath = if run_config.dataset != "local" {
+        requests::ConversationTextRequestGenerator::download_dataset(
+            run_config.dataset,
+            run_config.dataset_file,
+            run_config.hf_token.clone(),
+        )
+        .expect("Can't download dataset")
+    } else {
+        requests::ConversationTextRequestGenerator::string_to_pathbuf(
+            run_config.dataset_file.clone(),
+        )
+        .expect("Can't convert string to pathbuf")
+    };
     let requests = requests::ConversationTextRequestGenerator::load(
         filepath,
         run_config.tokenizer_name.clone(),
